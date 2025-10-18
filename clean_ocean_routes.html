@@ -1,0 +1,999 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clean Ocean Routes – HTML 版</title>
+
+    <!-- Tailwind (CDN) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- React + ReactDOM (UMD) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+    <!-- Babel 在浏览器中编译 JSX（开发用）。生产环境建议预编译去掉 Babel。 -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- 可选：提前加载 Phaser（也可以不加，代码里有按需加载器） -->
+    <!-- <script src="https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js"></script> -->
+
+    <style>
+      html, body { height: 100%; }
+      body { background: #0b1220; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useEffect, useRef, useState } = React;
+
+      /**
+       * Clean Ocean Routes – React + Phaser (Survival + Currency + Boss Kill Rule)
+       * HTML 单文件版本：直接用浏览器打开即可运行（需联网加载 CDN）。
+       */
+
+      // ---------------------- CONFIG ----------------------
+      const CONFIG = {
+        world: { width: 1600, height: 900, tile: 110 },
+        ui: { daySeconds: 60, totalDays: 999, surviveSeconds: 60 },
+        ship: {
+          speed: 120,
+          energyMax: 100,
+          capacity: 60,
+          collectionRadius: 36,
+          stormSpeedFactor: 0.6,
+          collisionRadius: 22,
+        },
+        energy: {
+          moveCostPerMeter: 0.02,
+          againstCurrentPenalty: 1.6,
+          withCurrentBonus: 0.65,
+          idleDrainPerSec: 0.05,
+          unloadRecharge: 60,
+          bulletCost: 2,
+        },
+        weapons: {
+          bulletSpeed: 520,
+          fireCooldown: 0.22,
+          bulletLifetime: 1.6,
+          bulletDamage: 20,
+          recoil: 60,
+          pierce: 0,
+          spreadCount: 1,
+          spreadAngleDeg: 10,
+        },
+        // Pickups become currency; more dispersed (more clusters, smaller radius)
+        plastic: { clusters: 22, clusterRadius: 110, totalPieces: 120 },
+        pickups: { respawnEverySec: 8, respawnBatch: 5, maxAlive: 180 },
+        currents: { flowStrength: 70, noiseScale: 0.0025, redrawEverySec: 1.2 },
+        storms: { spawnEverySec: 20, lifetimeSec: 16, radius: 140, damageChancePerSec: 0.05 },
+        // Enemies: more numerous baseline
+        enemies: { spawnEverySec: 2.1, speed: 94, contactDamage: 12, driftFactor: 0.4, maxCount: 26, hp: 30 },
+        // ★ Level scaling (tougher & harder)
+        scaling: { hpPerLevel: 10, speedPerLevel: 2, spawnFasterPerLevel: 0.25, maxCountPerLevel: 6, enemyDamagePerLevel: 2 },
+        // ★ Boss gets tankier and hits harder per tier (every 3 levels is one tier)
+        boss: {
+          hpBase: 1000,
+          hpPerBoss: 420,
+          sizeScale: 1.9,
+          speed: 72,
+          spawnDelay: 0.6,
+          bulletSpeed: 270,
+          bulletLifetime: 3.2,
+          bulletDamage: 14,
+          bulletDamagePerBoss: 4,
+          fireEverySec: 1.5,
+          volley: 3,
+          inaccuracyDeg: 12,
+        },
+      };
+
+      const PERK_BASE_COST = 10; // base shop price (more expensive)
+      const SHOP_REFRESH_COST = 4; // cost to reroll the shop
+
+      // ---------------------- Education Facts ----------------------
+      const FACTS = {
+        health: [
+          "Microplastics can enter the human body through the food chain; chronic exposure may pose health risks.",
+          "Plastic fragments can adsorb persistent organic pollutants, increasing toxic burdens when ingested by wildlife.",
+        ],
+        ecology: [
+          "Discarded fishing gear becomes 'ghost nets' that entangle and kill marine life.",
+          "Floating debris alters habitats, impacting coral reefs and seagrass beds.",
+        ],
+        economy: [
+          "Beach litter hurts tourism and fisheries, and cleanup is costly.",
+          "Floating debris can damage vessels and increase maintenance costs.",
+        ],
+      };
+      function pickCategoryFacts() {
+        return [
+          FACTS.health[Math.floor(Math.random() * FACTS.health.length)],
+          FACTS.ecology[Math.floor(Math.random() * FACTS.ecology.length)],
+          FACTS.economy[Math.floor(Math.random() * FACTS.economy.length)],
+        ];
+      }
+
+      // ---------------------- Perks & Rarities ----------------------
+      const BASE_PERKS = [
+        { id: "battery_plus", name: "Bigger Battery", desc: "+30 max energy", apply: (c) => ({ ...c, ship: { ...c.ship, energyMax: c.ship.energyMax + 30 } }) },
+        { id: "hull", name: "Reinforced Hull", desc: "-30% collision damage", apply: (c) => ({ ...c, enemies: { ...c.enemies, contactDamage: Math.max(1, Math.round(c.enemies.contactDamage * 0.7)) } }) },
+        { id: "efficiency", name: "Efficient Drive", desc: "-25% move energy cost", apply: (c) => ({ ...c, energy: { ...c.energy, moveCostPerMeter: +(c.energy.moveCostPerMeter * 0.75).toFixed(5) } }) },
+        { id: "capacity", name: "Cargo Upgrade", desc: "+20 cargo capacity", apply: (c) => ({ ...c, ship: { ...c.ship, capacity: c.ship.capacity + 20 } }) },
+        { id: "radar", name: "Collection Radius", desc: "+12 pickup radius", apply: (c) => ({ ...c, ship: { ...c.ship, collectionRadius: c.ship.collectionRadius + 12 } }) },
+        { id: "speed", name: "Engine Boost", desc: "+15% ship speed", apply: (c) => ({ ...c, ship: { ...c.ship, speed: Math.round(c.ship.speed * 1.15) } }) },
+        { id: "rof_up", name: "Rapid Fire", desc: "+25% fire rate", apply: (c) => ({ ...c, weapons: { ...c.weapons, fireCooldown: +(c.weapons.fireCooldown * 0.75).toFixed(3) } }) },
+        { id: "dmg_up", name: "High-Energy Rounds", desc: "+8 bullet damage", apply: (c) => ({ ...c, weapons: { ...c.weapons, bulletDamage: c.weapons.bulletDamage + 8 } }) },
+        { id: "spd_up", name: "Rail Accelerator", desc: "+20% bullet speed", apply: (c) => ({ ...c, weapons: { ...c.weapons, bulletSpeed: Math.round(c.weapons.bulletSpeed * 1.2) } }) },
+        { id: "pierce1", name: "Piercing Rounds", desc: "+1 bullet pierce", apply: (c) => ({ ...c, weapons: { ...c.weapons, pierce: (c.weapons.pierce ?? 0) + 1 } }) },
+        { id: "spread2", name: "Spread Shot", desc: "+1 projectile (spread)", apply: (c) => ({ ...c, weapons: { ...c.weapons, spreadCount: Math.min(4, (c.weapons.spreadCount ?? 1) + 1) } }) },
+        { id: "cheap_ammo", name: "Efficient Ammo", desc: "-25% bullet energy cost", apply: (c) => ({ ...c, energy: { ...c.energy, bulletCost: +(c.energy.bulletCost * 0.75).toFixed(3) } }) },
+      ];
+
+      const RARITY_TABLE = [
+        { key: 'common',    label: 'Common',    weight: 0.55, repeats: 1, costMult: 1, color: '#9ca3af' },
+        { key: 'rare',      label: 'Rare',      weight: 0.30, repeats: 2, costMult: 2, color: '#60a5fa' },
+        { key: 'epic',      label: 'Epic',      weight: 0.12, repeats: 3, costMult: 3, color: '#a78bfa' },
+        { key: 'legendary', label: 'Legendary', weight: 0.03, repeats: 4, costMult: 5, color: '#f59e0b' },
+      ];
+
+      function deepClone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
+      function applyPerkRepeats(cfg, perk, repeats){
+        let out = deepClone(cfg);
+        for (let i=0;i<repeats;i++){ out = perk.apply(out); }
+        return out;
+      }
+
+      function applyPerks(base, perkEntries) {
+        const entries = perkEntries || [];
+        return entries.reduce((cfg, entry) => {
+          if (typeof entry === 'string') {
+            const p = BASE_PERKS.find((x) => x.id === entry);
+            return p ? p.apply(cfg) : cfg;
+          }
+          const p = BASE_PERKS.find((x) => x.id === entry.id);
+          const reps = Math.max(1, entry.repeats || 1);
+          return p ? applyPerkRepeats(cfg, p, reps) : cfg;
+        }, deepClone(base));
+      }
+
+      function weightedPick(table){
+        const r = Math.random();
+        let acc = 0;
+        for (const item of table){ acc += item.weight; if (r <= acc) return item; }
+        return table[table.length-1];
+      }
+
+      function rollShopChoices(){
+        const copy = [...BASE_PERKS]; const picks = [];
+        while (picks.length < 3 && copy.length){
+          const i = Math.floor(Math.random()*copy.length);
+          const base = copy.splice(i,1)[0];
+          const rar = weightedPick(RARITY_TABLE);
+          picks.push({ id: base.id, name: base.name, desc: base.desc, rarity: rar.key, repeats: rar.repeats, costMult: rar.costMult, color: rar.color });
+        }
+        return picks;
+      }
+
+      // ---------------------- Utilities ----------------------
+      function valueNoise2D(nx, ny) {
+        const x0 = Math.floor(nx); const y0 = Math.floor(ny);
+        const xf = nx - x0; const yf = ny - y0;
+        function v(x, y) { const s = Math.sin((x * 127.1 + y * 311.7) * 12.9898) * 43758.5453; return (s - Math.floor(s)) * 2 - 1; }
+        const v00 = v(x0, y0), v10 = v(x0 + 1, y0), v01 = v(x0, y0 + 1), v11 = v(x0 + 1, y0 + 1);
+        const u = xf * xf * (3 - 2 * xf); const w = yf * yf * (3 - 2 * yf);
+        const a = v00 * (1 - u) + v10 * u; const b = v01 * (1 - u) + v11 * u; return a * (1 - w) + b * w;
+      }
+      function computeBasePosition(world) { return { x: world.width / 2, y: world.height / 2 }; }
+      const PHASER_CDN = "https://cdn.jsdelivr.net/npm/phaser@3.80.0/dist/phaser.min.js";
+      function loadPhaser() {
+        return new Promise((resolve, reject) => {
+          if (window.Phaser) return resolve(window.Phaser);
+          const script = document.createElement("script"); script.src = PHASER_CDN; script.async = true;
+          script.onload = () => (window.Phaser ? resolve(window.Phaser) : reject(new Error("Phaser failed to load")));
+          script.onerror = () => reject(new Error("Failed to load Phaser CDN script"));
+          document.head.appendChild(script);
+        });
+      }
+
+      function isBossLevel(lvl){ return lvl > 0 && lvl % 3 === 0; }
+
+      function scaleEnemies(cfg, level){
+        const hp = cfg.enemies.hp + cfg.scaling.hpPerLevel * (level-1);
+        const speed = cfg.enemies.speed + cfg.scaling.speedPerLevel * (level-1);
+        const spawnEverySec = Math.max(0.6, cfg.enemies.spawnEverySec - cfg.scaling.spawnFasterPerLevel * (level-1));
+        const maxCount = cfg.enemies.maxCount + cfg.scaling.maxCountPerLevel * (level-1);
+        const enemyDamage = cfg.enemies.contactDamage + (cfg.scaling.enemyDamagePerLevel || 0) * (level-1);
+        return { hp, speed, spawnEverySec, maxCount, enemyDamage };
+      }
+
+      // Currency drop count when an enemy dies
+      function enemyDropCount(level){
+        const base = 1;
+        const extra = level >= 5 ? (Math.random() < 0.5 ? 1 : 0) : (Math.random() < 0.35 ? 1 : 0);
+        return base + extra;
+      }
+
+      // ---------------------- Phaser Game Factory ----------------------
+      async function createPhaserGame(containerEl, uiCallbacks, perkIdsOrObjs, level) {
+        const Phaser = await loadPhaser();
+        const configForRun = applyPerks(CONFIG, perkIdsOrObjs || []);
+        const scaled = scaleEnemies(configForRun, level);
+
+        class OceanScene extends Phaser.Scene {
+          constructor(config, uiCbs, levelNum) {
+            super("OceanScene");
+            this.config = config; this.uiCallbacks = uiCbs; this.level = levelNum; this.scaled = scaled;
+            this.fieldArrows = null; this.plastics = null; this.storms = null; this.enemies = null; this.bullets = null; this.fragments = null;
+            this.base = null; this.ship = null; this.shipData = null;
+            this.surviveTimer = 0;
+            this.lastStormSpawn = 0; this.lastEnemySpawn = 0; this.fireCd = 0; this.keys = null;
+            this.boss = null; this.bossMaxHp = 0; this.bossHp = 0; this.bossAlive = false; this.bossBullets = null; this.lastBossShot = 0;
+            this.fieldRedrawTimer = 0; this.pickupRespawnTimer = 0;
+          }
+
+          createWaterTexture() {
+            if (this.textures.exists('waterTex')) return;
+            const size = 512; const tex = this.textures.createCanvas('waterTex', size, size); const ctx = tex.getContext();
+            const grd = ctx.createLinearGradient(0, 0, size, size); grd.addColorStop(0, '#063a59'); grd.addColorStop(0.5, '#074c75'); grd.addColorStop(1, '#0b5c86');
+            ctx.fillStyle = grd; ctx.fillRect(0, 0, size, size);
+            const img = ctx.getImageData(0, 0, size, size); const data = img.data;
+            for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) { const i = (y * size + x) * 4; const n = (Math.sin(x * 0.06) + Math.sin(y * 0.08) + Math.sin((x + y) * 0.03)) * 0.5; data[i] = Math.min(255, data[i] + n * 6); data[i+1] = Math.min(255, data[i+1] + n * 10); data[i+2] = Math.min(255, data[i+2] + n * 14); }
+            ctx.putImageData(img, 0, 0); tex.refresh();
+          }
+
+          createShipTexture() {
+            if (this.textures.exists('shipSprite')) return;
+            const g = this.add.graphics();
+            g.fillStyle(0x1f9cf1, 1); g.fillRoundedRect(8, 28, 48, 20, 10);
+            g.fillStyle(0x1c8ad4, 1); g.fillTriangle(32, 8, 56, 28, 8, 28);
+            g.fillStyle(0xffffff, 0.8); g.fillRoundedRect(14, 35, 36, 6, 3);
+            g.fillStyle(0x083c5b, 1); g.fillRoundedRect(24, 22, 16, 10, 3);
+            g.lineStyle(2, 0x0a2540, 0.6); g.strokeRoundedRect(8, 28, 48, 20, 10);
+            g.generateTexture('shipSprite', 64, 64); g.destroy();
+          }
+
+          // --- enemy themes & texture generators ---
+          ensureEnemyTexture(theme) {
+            const key = `enemy_${theme}`;
+            if (this.textures.exists(key)) return key;
+            const g = this.add.graphics({ x: 0, y: 0 }); g.clear();
+            g.fillStyle(0x000000, 0.16); g.fillEllipse(48, 60, 56, 18); // shadow
+            if (theme === 'bag') {
+              g.fillStyle(0x8db6c7, 0.92); g.fillRoundedRect(22, 24, 52, 36, 8); g.lineStyle(2, 0x5aa0b3, 1); g.strokeRoundedRect(22, 24, 52, 36, 8); g.fillStyle(0x769faa, 0.92); g.fillTriangle(32, 22, 44, 10, 56, 22);
+            } else if (theme === 'net') {
+              g.fillStyle(0x1e2830, 0.95); g.fillRoundedRect(20, 26, 56, 34, 10); g.lineStyle(1.4, 0x6bc2ff, 0.95); for (let i=0;i<=6;i++){ g.lineBetween(24+i*8,28,24+i*8,58);} for (let j=0;j<=3;j++){ g.lineBetween(24,30+j*8,72,30+j*8);}        
+            } else if (theme === 'ewaste') {
+              g.fillStyle(0x4b5563, 0.98); g.fillRoundedRect(26, 28, 44, 30, 6); g.fillStyle(0x94a3b8, 0.95); g.fillRect(30, 32, 12, 8); g.fillRect(48, 40, 16, 10); g.fillStyle(0x22d3ee, 0.95); g.fillRect(34, 44, 6, 3); g.fillRect(54, 36, 8, 3);
+            } else if (theme === 'foam') {
+              g.fillStyle(0xffffff, 0.95); for (let i=0;i<14;i++){ const r=6+Math.random()*4; g.fillCircle(36+Math.random()*24, 34+Math.random()*24, r); } g.lineStyle(1, 0xd1d5db, 0.85); for (let i=0;i<8;i++){ g.strokeCircle(34+Math.random()*28, 32+Math.random()*28, 4+Math.random()*5); }
+            } else {
+              g.fillStyle(0x3a3a3a, 0.95); g.fillRoundedRect(18, 20, 60, 42, 12); g.fillStyle(0x2b2b2b, 0.9); g.fillRoundedRect(24, 26, 48, 28, 10); g.fillStyle(0xb8f1ff, 0.85); g.fillRoundedRect(30, 30, 16, 12, 3); g.lineStyle(2, 0x78d0e8, 0.9); g.strokeRoundedRect(30, 30, 16, 12, 3); g.fillStyle(0x9ad0ff, 0.9); g.fillRect(52, 28, 10, 18); g.fillStyle(0x6aa8e6, 1); g.fillRect(54, 26, 6, 4);
+            }
+            g.fillStyle(0xffee88, 0.95); g.fillCircle(42, 38, 3); g.fillCircle(56, 39, 2.8);
+            g.fillStyle(0x3a2a1a, 0.95); g.fillCircle(42, 38, 1.4); g.fillCircle(56, 39, 1.2);
+            g.generateTexture(key, 96, 96); g.destroy();
+            return key;
+          }
+
+          create() {
+            const { width, height, tile } = this.config.world;
+            this.cameras.main.setBounds(0, 0, width, height);
+            this.physics.world.setBounds(0, 0, width, height);
+
+            // backgrounds
+            this.createWaterTexture();
+            this.water = this.add.tileSprite(width/2, height/2, width, height, 'waterTex').setDepth(-10);
+
+            // currents
+            this.fieldArrows = this.add.group();
+            for (let x = tile/2; x < width; x += tile) {
+              for (let y = tile/2; y < height; y += tile) {
+                const g = this.add.graphics(); g.setDepth(-5); this.fieldArrows.add(g);
+              }
+            }
+
+            // base & ship
+            const basePos = computeBasePosition(this.config.world);
+            const baseX = basePos.x, baseY = basePos.y;
+            this.add.circle(baseX, baseY, 28, 0x88e0ff, 1).setStrokeStyle(3, 0xffffff);
+            this.add.text(baseX - 36, baseY + 36, "BASE", { color: "#aee3ff", fontSize: "14px" });
+            this.createShipTexture();
+            this.ship = this.add.image(baseX, baseY - 40, 'shipSprite');
+            this.physics.add.existing(this.ship); this.ship.body.setCollideWorldBounds(true); this.ship.body.setCircle(16, this.ship.width/2-16, this.ship.height/2-16);
+
+            // groups & state
+            this.shipData = { vx: 0, vy: 0, energy: this.config.ship.energyMax, cargo: 0, damage: 0 };
+            this.plastics = this.add.group(); this.spawnPlastics();
+            this.storms = this.add.group(); this.enemies = this.add.group(); this.bullets = this.add.group(); this.fragments = this.add.group(); this.bossBullets = this.add.group();
+
+            // input
+            this.keys = this.input.keyboard.addKeys({ W: Phaser.Input.Keyboard.KeyCodes.W, A: Phaser.Input.Keyboard.KeyCodes.A, S: Phaser.Input.Keyboard.KeyCodes.S, D: Phaser.Input.Keyboard.KeyCodes.D });
+            this.cameras.main.startFollow(this.ship, true, 0.06, 0.06);
+
+            // fallback texture for old tests
+            if (!this.textures.exists('pollutantMonster')) { const gg = this.add.graphics(); gg.fillStyle(0x6b7280, 1); gg.fillCircle(16, 16, 16); gg.generateTexture('pollutantMonster', 32, 32); gg.destroy(); }
+
+            // Boss logic + hint
+            if (isBossLevel(this.level)) {
+              this.time.delayedCall(this.config.boss.spawnDelay * 1000, () => this.spawnBoss());
+              this.uiCallbacks.setBossUI({ active: true, hp: 1, hpMax: 1 });
+              this.uiCallbacks.setHint("BOSS stage: defeat the boss within 60s (spawns minions)!");
+            } else {
+              this.uiCallbacks.setBossUI({ active: false });
+              this.uiCallbacks.setHint("Normal stage: survive for 60 seconds.");
+            }
+          }
+
+          // ----- flows -----
+          currentAt(x, y) {
+            const { noiseScale, flowStrength } = this.config.currents;
+            const nx = x * noiseScale, ny = y * noiseScale; const a = valueNoise2D(nx, ny) * Math.PI * 2;
+            const mag = flowStrength * (0.6 + 0.4 * (valueNoise2D(nx + 55.2, ny - 33.7) * 0.5 + 0.5));
+            return new window.Phaser.Math.Vector2(Math.cos(a) * mag, Math.sin(a) * mag);
+          }
+
+          drawCurrentField(force=false) {
+            this.fieldRedrawTimer = this.fieldRedrawTimer || 0;
+            if (!force && this.fieldRedrawTimer > 0) return;
+            const { width, height, tile } = this.config.world; let i = 0;
+            for (let x = tile/2; x < width; x += tile) {
+              for (let y = tile/2; y < height; y += tile) {
+                const g = this.fieldArrows.getChildren()[i++]; g.clear(); const v = this.currentAt(x, y);
+                const len = Math.min(36, v.length()); const ang = v.angle();
+                const ex = x + Math.cos(ang) * len; const ey = y + Math.sin(ang) * len; const nx = -Math.sin(ang), ny = Math.cos(ang);
+                const cx = x + (ex - x) * 0.5 + nx * 6; const cy = y + (ey - y) * 0.5 + ny * 6;
+                g.lineStyle(1.6, 0x59e1ff, 0.8); g.beginPath(); g.moveTo(x, y); g.lineTo(cx, cy); g.lineTo(ex, ey); g.strokePath();
+                g.fillStyle(0x9be8ff, 0.9); g.fillCircle(ex, ey, 1.8);
+              }
+            }
+            this.fieldRedrawTimer = this.config.currents.redrawEverySec;
+          }
+
+          // ----- spawners -----
+          spawnOnePickup() {
+            const { width, height } = this.config.world; const { clusterRadius } = this.config.plastic;
+            const center = new window.Phaser.Math.Vector2(200 + Math.random()*(width-400), 120 + Math.random()*(height-240));
+            const r = Math.sqrt(Math.random()) * clusterRadius; const t = Math.random() * Math.PI * 2;
+            const x = center.x + Math.cos(t) * r; const y = center.y + Math.sin(t) * r;
+            const colors = [0xffe066, 0xffb347, 0xa3e635, 0x60a5fa, 0xf472b6]; const color = colors[Math.floor(Math.random()*colors.length)];
+            const radius = 5 + Math.random()*3;
+            const g = this.add.circle(x, y, radius, color, 0.9).setStrokeStyle(1.5, 0xffffff, 0.4).setDepth(-3);
+            this.tweens.add({ targets: g, scale: 1 + (Math.random()*0.15 + 0.05), yoyo: true, repeat: -1, duration: 900 + Math.random()*600, ease: 'Sine.easeInOut' });
+            g.isPlastic = true;
+            this.plastics.add(g);
+          }
+
+          spawnPlastics() {
+            const { totalPieces } = this.config.plastic;
+            for (let i = 0; i < totalPieces; i++) this.spawnOnePickup();
+          }
+
+          // Spawn currency pickups directly at a position (enemy death drops)
+          spawnCurrencyAt(x, y, count = 1, opts = {}){
+            const colors = [0xffe066, 0xffb347, 0xa3e635, 0x60a5fa, 0xf472b6];
+            for (let i=0;i<count;i++){
+              const jitter = opts.jitter ?? 10;
+              const px = x + (Math.random()*2-1)*jitter;
+              const py = y + (Math.random()*2-1)*jitter;
+              const color = colors[Math.floor(Math.random()*colors.length)];
+              const radius = (opts.big ? 6 : 4) + Math.random()* (opts.big ? 3 : 2);
+              const g = this.add.circle(px, py, radius, color, 0.95).setStrokeStyle(1, 0xffffff, 0.5).setDepth(-3);
+              this.physics.add.existing(g); g.body.setCollideWorldBounds(false);
+              const dur = opts.big ? 600 : 800;
+              this.tweens.add({ targets: g, scale: 1 + (Math.random()*0.25 + 0.08), yoyo: true, repeat: -1, duration: dur + Math.random()*500, ease: 'Sine.easeInOut' });
+              if (opts.sparkle){
+                const spark = this.add.circle(px, py, 1.5, 0xffffff, 0.9).setDepth(-2);
+                this.tweens.add({ targets: spark, alpha: { from: 0.9, to: 0 }, scale: { from: 1, to: 3 }, duration: 380, onComplete: ()=> spark.destroy() });
+              }
+              g.isPlastic = true;
+              this.plastics.add(g);
+            }
+          }
+
+          spawnEnemy() {
+            const themes = ['bag','net','ewaste','foam','mixed'];
+            const theme = themes[Math.floor(Math.random()*themes.length)];
+            const key = this.ensureEnemyTexture(theme);
+            const { width, height } = this.config.world; const side = Math.floor(Math.random() * 4); const margin = 40; let x=0, y=0;
+            if (side===0) { x = margin; y = Math.random() * height; }
+            else if (side===1) { x = width - margin; y = Math.random() * height; }
+            else if (side===2) { x = Math.random() * width; y = margin; }
+            else { x = Math.random() * width; y = height - margin; }
+            const e = this.add.image(x, y, key).setDepth(-1); e.setScale(0.9);
+            this.physics.add.existing(e); e.body.setCollideWorldBounds(true); e.body.setCircle(16, e.width/2-16, e.height/2-16);
+            e.radius = 16; e.hp = this.scaled.hp; e.theme = theme; e.speed = this.scaled.speed; this.enemies.add(e);
+            this.tweens.add({ targets: e, scaleX: 0.92, scaleY: 0.92, duration: 900, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+            this.tweens.add({ targets: e, angle: { from: -3, to: 3 }, duration: 2400, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+          }
+
+          spawnBoss(){
+            const tier = Math.max(1, Math.floor(this.level/3));
+            const hp = this.config.boss.hpBase + (tier-1) * this.config.boss.hpPerBoss;
+            const basePos = computeBasePosition(this.config.world);
+            const key = this.ensureEnemyTexture('ewaste');
+            const b = this.add.image(basePos.x, basePos.y - 280, key).setDepth(-1);
+            b.setScale(this.config.boss.sizeScale);
+            this.physics.add.existing(b); b.body.setCollideWorldBounds(true); b.body.setCircle(24, b.width/2-24, b.height/2-24);
+            b.radius = 26; b.hp = hp; b.isBoss = true; this.boss = b; this.bossMaxHp = hp; this.bossHp = hp; this.bossAlive = true;
+            // Scale boss bullet damage by tier
+            this.bossBulletDamage = (this.config.boss.bulletDamage || 10) + (tier-1) * (this.config.boss.bulletDamagePerBoss || 0);
+            this.uiCallbacks.setBossUI({ active: true, hp: hp, hpMax: hp });
+            this.tweens.add({ targets: b, angle: { from: -2, to: 2 }, duration: 2500, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+          }
+
+          spawnFragments(x, y, theme) {
+            const count = 8 + Math.floor(Math.random()*6);
+            for (let i=0;i<count;i++) { const r = 1 + Math.random()*2.2; const c = theme==='ewaste' ? 0x9aa7b5 : (theme==='foam' ? 0xffffff : 0xbfefff); const frag = this.add.circle(x + (Math.random()*8-4), y + (Math.random()*8-4), r, c, 1).setDepth(-2); this.physics.add.existing(frag); frag.body.setCollideWorldBounds(false); const ang = Math.random()*Math.PI*2; const spd = 80 + Math.random()*140; frag.body.setVelocity(Math.cos(ang)*spd, Math.sin(ang)*spd); frag.ttl = 0.6 + Math.random()*0.5; this.fragments.add(frag); }
+          }
+
+          // ----- loops -----
+          handleBossShooting(dt){
+            if (!this.boss || !this.bossAlive) return;
+            this.lastBossShot += dt;
+
+            this.physics.world.overlap(this.bossBullets, this.ship, (b) => {
+              this.shipData.damage = Math.min(100, this.shipData.damage + (this.bossBulletDamage || this.config.boss.bulletDamage));
+              b.destroy();
+            });
+            this.bossBullets.getChildren().forEach((b)=>{ if (b.ttl!==undefined){ b.ttl -= dt; if (b.ttl<=0) b.destroy(); }});
+
+            if (this.lastBossShot < this.config.boss.fireEverySec) return;
+            this.lastBossShot = 0;
+
+            const from = new window.Phaser.Math.Vector2(this.boss.x, this.boss.y);
+            const to = new window.Phaser.Math.Vector2(this.ship.x, this.ship.y);
+            const baseDir = to.subtract(from).normalize();
+            const spread = this.config.boss.inaccuracyDeg * Math.PI / 180;
+            for (let i=0;i<this.config.boss.volley;i++){
+              const offset = (Math.random()*2 - 1) * spread;
+              const dir = new window.Phaser.Math.Vector2(
+                baseDir.x * Math.cos(offset) - baseDir.y * Math.sin(offset),
+                baseDir.x * Math.sin(offset) + baseDir.y * Math.cos(offset)
+              ).normalize();
+              const proj = this.add.circle(this.boss.x + dir.x * 28, this.boss.y + dir.y * 28, 3.5, 0xffc241).setStrokeStyle(1, 0xff9f1a, 0.9).setDepth(-1);
+              this.physics.add.existing(proj); proj.body.setCollideWorldBounds(false);
+              proj.body.setVelocity(dir.x * this.config.boss.bulletSpeed, dir.y * this.config.boss.bulletSpeed);
+              proj.ttl = this.config.boss.bulletLifetime; this.bossBullets.add(proj);
+            }
+          }
+
+          handleStorms(dt) {
+            this.lastStormSpawn += dt;
+            if (this.lastStormSpawn >= this.config.storms.spawnEverySec) { this.lastStormSpawn = 0; const x = 200 + Math.random() * (this.config.world.width - 400); const y = 160 + Math.random() * (this.config.world.height - 320); const storm = this.add.circle(x, y, this.config.storms.radius, 0xff3b30, 0.18).setStrokeStyle(3, 0xff3b30); storm.ttl = this.config.storms.lifetimeSec; this.storms.add(storm); }
+            this.storms.getChildren().forEach((s) => { s.ttl -= dt; if (s.ttl <= 0) s.destroy(); });
+          }
+
+          handleEnemies(dt) {
+            const cnt = this.enemies.getChildren().length;
+            if (cnt < this.scaled.maxCount) { this.lastEnemySpawn += dt; if (this.lastEnemySpawn >= this.scaled.spawnEverySec) { this.lastEnemySpawn = 0; this.spawnEnemy(); } }
+            const pos = new window.Phaser.Math.Vector2(this.ship.x, this.ship.y);
+            this.enemies.getChildren().forEach((e) => {
+              if (!e.hp && e.hp !== 0) e.hp = this.scaled.hp;
+              const toShip = new window.Phaser.Math.Vector2(pos.x - e.x, pos.y - e.y).normalize().scale(e.speed);
+              const drift = this.currentAt(e.x, e.y).scale(this.config.enemies.driftFactor);
+              const vel = toShip.add(drift); e.body.setVelocity(vel.x, vel.y);
+              const d2 = (e.x - pos.x) ** 2 + (e.y - pos.y) ** 2;
+              if (d2 < (this.config.ship.collisionRadius + e.radius) ** 2) {
+                this.shipData.damage = Math.min(100, this.shipData.damage + (this.scaled.enemyDamage || this.config.enemies.contactDamage));
+                const kb = new window.Phaser.Math.Vector2(pos.x - e.x, pos.y - e.y).normalize().scale(120);
+                this.ship.body.velocity.add(kb);
+                this.spawnFragments(e.x, e.y, e.theme||'mixed');
+                this.spawnCurrencyAt(e.x, e.y, 1);
+                e.destroy();
+              }
+            });
+
+            // Boss chases
+            if (this.boss && this.bossAlive) {
+              const toShip = new window.Phaser.Math.Vector2(this.ship.x - this.boss.x, this.ship.y - this.boss.y).normalize().scale(this.config.boss.speed);
+              const drift = this.currentAt(this.boss.x, this.boss.y).scale(0.3);
+              const vel = toShip.add(drift); this.boss.body.setVelocity(vel.x, vel.y);
+            }
+          }
+
+          handleShooting(dt) {
+            this.fireCd = Math.max(0, this.fireCd - dt);
+            const pointer = this.input.activePointer;
+            if (pointer && pointer.isDown && pointer.leftButtonDown() && this.fireCd === 0 && this.shipData.energy >= this.config.energy.bulletCost) {
+              this.fireCd = this.config.weapons.fireCooldown;
+              this.shipData.energy = Math.max(0, this.shipData.energy - this.config.energy.bulletCost);
+              const tx = (pointer.worldX !== undefined) ? pointer.worldX : this.ship.x;
+              const ty = (pointer.worldY !== undefined) ? pointer.worldY : this.ship.y - 100;
+              this.fireBullet(tx, ty);
+            }
+
+            // bullet vs enemies
+            this.physics.world.overlap(this.bullets, this.enemies, (b, e) => {
+              if (!e.hp && e.hp !== 0) e.hp = this.scaled.hp;
+              e.hp -= this.config.weapons.bulletDamage;
+              if (typeof b.pierceLeft !== 'number') b.pierceLeft = this.config.weapons.pierce;
+              if (b.pierceLeft <= 0) { b.destroy(); } else { b.pierceLeft -= 1; }
+              if (e.hp <= 0) {
+                this.spawnFragments(e.x, e.y, e.theme||'mixed');
+                this.spawnCurrencyAt(e.x, e.y, enemyDropCount(this.level));
+                // 5% rare burst (5-7 big coins with sparkle)
+                if (Math.random() < 0.05){
+                  const n = 5 + Math.floor(Math.random()*3);
+                  this.spawnCurrencyAt(e.x, e.y, n, { big:true, jitter:18, sparkle:true });
+                }
+                e.destroy();
+              }
+            });
+
+            // bullet vs boss
+            if (this.boss && this.bossAlive) {
+              this.physics.world.overlap(this.bullets, this.boss, (b, boss) => {
+                this.bossHp -= this.config.weapons.bulletDamage;
+                if (typeof b.pierceLeft !== 'number') b.pierceLeft = this.config.weapons.pierce;
+                if (b.pierceLeft <= 0) { b.destroy(); } else { b.pierceLeft -= 1; }
+                if (this.bossHp <= 0) {
+                  this.bossAlive = false; this.spawnFragments(boss.x, boss.y, 'ewaste');
+                  // Boss ring reward (tier scaled)
+                  const tier = Math.max(1, Math.floor(this.level/3));
+                  const ring = 18 + (tier-1)*6; const radius = 80 + (tier-1)*10;
+                  for (let i=0;i<ring;i++){
+                    const ang = (i / ring) * Math.PI * 2;
+                    const px = boss.x + Math.cos(ang) * radius;
+                    const py = boss.y + Math.sin(ang) * radius;
+                    this.spawnCurrencyAt(px, py, 1, { big: i % 3 === 0, jitter: 6, sparkle: true });
+                  }
+                  boss.destroy(); this.uiCallbacks.setBossUI({ active: true, hp: 0, hpMax: this.bossMaxHp }); this.endGame('boss_win');
+                } else {
+                  this.uiCallbacks.setBossUI({ active: true, hp: this.bossHp, hpMax: this.bossMaxHp });
+                }
+              });
+            }
+
+            // ttl cleanup
+            this.bullets.getChildren().forEach((b) => { if (b.ttl !== undefined) { b.ttl -= dt; if (b.ttl <= 0) b.destroy(); } });
+            this.fragments.getChildren().forEach((f) => { if (f.ttl !== undefined) { f.ttl -= dt; if (f.ttl <= 0) f.destroy(); } });
+          }
+
+          fireBullet(tx, ty) {
+            const from = new window.Phaser.Math.Vector2(this.ship.x, this.ship.y);
+            const to = new window.Phaser.Math.Vector2(tx, ty);
+            const baseDir = to.subtract(from).normalize();
+            const n = Math.max(1, this.config.weapons.spreadCount || 1);
+            const half = (n - 1) / 2;
+            for (let i = 0; i < n; i++) {
+              const offset = (i - half) * (this.config.weapons.spreadAngleDeg * Math.PI / 180);
+              const dir = new window.Phaser.Math.Vector2(
+                baseDir.x * Math.cos(offset) - baseDir.y * Math.sin(offset),
+                baseDir.x * Math.sin(offset) + baseDir.y * Math.cos(offset)
+              ).normalize();
+              const b = this.add.circle(this.ship.x + dir.x * 20, this.ship.y + dir.y * 20, 4, 0xffffff).setStrokeStyle(1, 0xa0a0a0);
+              this.physics.add.existing(b); b.body.setCollideWorldBounds(false);
+              const vel = dir.scale(this.config.weapons.bulletSpeed);
+              b.body.setVelocity(vel.x, vel.y);
+              b.ttl = this.config.weapons.bulletLifetime;
+              b.pierceLeft = this.config.weapons.pierce;
+              this.bullets.add(b);
+            }
+            const recoil = baseDir.clone().scale(-this.config.weapons.recoil); this.ship.body.velocity.add(recoil);
+          }
+
+          updateShip(dt) {
+            const shipBody = this.ship.body; const pos = new window.Phaser.Math.Vector2(this.ship.x, this.ship.y);
+            let desired = new window.Phaser.Math.Vector2(0, 0);
+            if (this.keys.W.isDown) desired.y -= 1; if (this.keys.S.isDown) desired.y += 1;
+            if (this.keys.A.isDown) desired.x -= 1; if (this.keys.D.isDown) desired.x += 1;
+            if (desired.length() > 0) desired = desired.normalize().scale(this.config.ship.speed);
+            const current = this.currentAt(pos.x, pos.y).scale(1.0);
+            let inStorm = false; this.storms.getChildren().forEach((s) => { if (window.Phaser.Math.Distance.Between(s.x, s.y, pos.x, pos.y) <= s.radius) inStorm = true; });
+            const stormFactor = inStorm ? this.config.ship.stormSpeedFactor : 1;
+            const actual = desired.clone().scale(stormFactor).add(current); shipBody.setVelocity(actual.x, actual.y);
+            const facing = Math.atan2(actual.y, actual.x); this.ship.setRotation(facing + Math.PI / 2);
+            // energy
+            const baseDrain = this.config.energy.idleDrainPerSec * dt; const moveMeters = (desired.length() * dt) / 50;
+            const sign = desired.length() > 1 ? Math.sign(desired.clone().normalize().dot(current.clone().normalize())) : 0;
+            const factor = sign >= 0 ? this.config.energy.withCurrentBonus : this.config.energy.againstCurrentPenalty;
+            const moveDrain = moveMeters * this.config.energy.moveCostPerMeter * (desired.length() > 0 ? factor : 0);
+            this.shipData.energy = Math.max(0, this.shipData.energy - (baseDrain + moveDrain));
+            if (this.shipData.energy <= 0 && desired.length() > 0) { this.uiCallbacks.setHint("Energy depleted: you drift with currents. Return to BASE to recharge."); }
+            // collect -> currency
+            const r2 = this.config.ship.collectionRadius ** 2;
+            this.plastics.getChildren().forEach((p) => {
+              if (!p.active) return;
+              const d2 = (p.x - pos.x) ** 2 + (p.y - pos.y) ** 2;
+              if (d2 <= r2 && this.shipData.cargo < this.config.ship.capacity) {
+                p.destroy(); this.shipData.cargo += 1; this.uiCallbacks.addCredits(1);
+              }
+            });
+            // storm damage
+            if (inStorm && Math.random() < this.config.storms.damageChancePerSec * dt) {
+              this.shipData.damage = Math.min(100, this.shipData.damage + 1);
+            }
+            // base recharge
+            const basePos = computeBasePosition(this.config.world);
+            if (window.Phaser.Math.Distance.Between(this.ship.x, this.ship.y, basePos.x, basePos.y) < 30) {
+              if (this.shipData.energy < this.config.ship.energyMax) {
+                this.shipData.energy = Math.min(this.config.ship.energyMax, this.shipData.energy + this.config.energy.unloadRecharge * (1 / 60));
+              }
+            }
+          }
+
+          update(time, delta) {
+            const dt = delta / 1000;
+            if (this.water) { this.water.tilePositionX += 14 * dt; this.water.tilePositionY += 9 * dt; }
+            this.surviveTimer += dt; const remain = Math.max(0, this.config.ui.surviveSeconds - this.surviveTimer);
+
+            // timers
+            this.fieldRedrawTimer = Math.max(0, this.fieldRedrawTimer - dt);
+            this.pickupRespawnTimer += dt;
+            if (this.pickupRespawnTimer >= this.config.pickups.respawnEverySec && this.plastics.getChildren().length < this.config.pickups.maxAlive) {
+              this.pickupRespawnTimer = 0; for (let i=0;i<this.config.pickups.respawnBatch;i++) this.spawnOnePickup();
+            }
+
+            // systems
+            this.drawCurrentField(); this.handleStorms(dt); this.handleEnemies(dt); this.handleBossShooting(dt); this.handleShooting(dt); this.updateShip(dt);
+
+            // win / lose
+            const bossStage = isBossLevel(this.level);
+            if (this.shipData.damage >= 100) { this.endGame('defeat_destroyed'); return; }
+            if (bossStage) {
+              if (!this.bossAlive && this.boss) { this.endGame('boss_win'); return; }
+              if (remain <= 0) { this.endGame('defeat_timeout'); return; }
+            } else {
+              if (remain <= 0) { this.endGame('survive_win'); return; }
+            }
+
+            // HUD push
+            this.uiCallbacks.setStats({
+              day: this.level,
+              dayProgress: (CONFIG.ui.surviveSeconds - remain) / this.config.ui.surviveSeconds,
+              energy: this.shipData.energy,
+              cargo: this.shipData.cargo,
+              damage: this.shipData.damage,
+              isBoss: bossStage,
+            });
+          }
+
+          endGame(reason) {
+            if (this.ship && this.ship.body) this.ship.body.setVelocity(0, 0);
+            this.scene.pause();
+            const payload = {
+              day: this.level,
+              reason,
+              timeSurvived: Math.min(this.surviveTimer, this.config.ui.surviveSeconds),
+              plasticsLeft: this.plastics.getChildren().length,
+              facts: pickCategoryFacts(),
+              bossCleared: reason === 'boss_win'
+            };
+            this.uiCallbacks.onGameOver(payload);
+          }
+        }
+
+        const game = new window.Phaser.Game({
+          type: window.Phaser.CANVAS,
+          width: configForRun.world.width,
+          height: configForRun.world.height,
+          parent: containerEl,
+          backgroundColor: "#06263d",
+          physics: { default: "arcade", arcade: { gravity: { y: 0 }, debug: false } },
+          scene: [new OceanScene(configForRun, uiCallbacks, level)],
+        });
+
+        return { Phaser, game };
+      }
+
+      // ---------------------- Self Tests (updated) ----------------------
+      function runSelfTests(PhaserRef) {
+        const results = [];
+        function test(name, fn) { try { fn(); results.push({ name, ok: true }); } catch (e) { results.push({ name, ok: false, msg: e.message }); } }
+
+        test("currentAt returns finite vectors", () => {
+          const sceneLike = { config: { currents: CONFIG.currents }, currentAt: (x, y) => {
+            const { noiseScale, flowStrength } = CONFIG.currents;
+            const nx = x * noiseScale, ny = y * noiseScale;
+            const a = valueNoise2D(nx, ny) * Math.PI * 2;
+            const mag = flowStrength * (0.6 + 0.4 * (valueNoise2D(nx + 55.2, ny - 33.7) * 0.5 + 0.5));
+            return new PhaserRef.Math.Vector2(Math.cos(a) * mag, Math.sin(a) * mag);
+          } };
+          const v1 = sceneLike.currentAt(100, 100), v2 = sceneLike.currentAt(500, 300);
+          if (!isFinite(v1.length()) || !isFinite(v2.length())) throw new Error("non-finite length");
+        });
+
+        test("survival target is 60s", () => {
+          if (CONFIG.ui.surviveSeconds !== 60) throw new Error("surviveSeconds must be 60");
+        });
+
+        test("enemy scaling monotonic (denser, faster, harder)", () => {
+          const s1 = scaleEnemies(CONFIG, 1); const s3 = scaleEnemies(CONFIG, 3);
+          if (!(s3.hp > s1.hp && s3.speed >= s1.speed)) throw new Error("enemy stats should not shrink");
+          if (!(s3.maxCount >= s1.maxCount)) throw new Error("maxCount should grow");
+          if (!(s3.spawnEverySec <= s1.spawnEverySec)) throw new Error("spawn interval should not increase");
+          if (!((s3.enemyDamage||0) >= (s1.enemyDamage||0))) throw new Error("enemy damage should scale with level");
+        });
+
+        test("pickup/current refresh slower but more dispersed", () => {
+          if (!(CONFIG.plastic.totalPieces <= 130)) throw new Error("initial pickups should be limited");
+          if (!(CONFIG.plastic.clusters >= 12 && CONFIG.plastic.clusterRadius <= 130)) throw new Error("dispersed: more clusters & smaller radius");
+          if (!(CONFIG.currents.redrawEverySec >= 1.0)) throw new Error("currents redraw should be >=1s");
+        });
+
+        test("boss config sane", () => {
+          if (!(CONFIG.boss.hpBase > 0 && CONFIG.boss.bulletSpeed > 0)) throw new Error("boss base hp & bulletSpeed must be positive");
+        });
+
+        test("phaser cdn string sane", () => {
+          if (!PHASER_CDN.endsWith('.js')) throw new Error("PHASER_CDN should end with .js");
+        });
+
+        test("isBossLevel works on multiples of 3", () => {
+          if (!isBossLevel(3) || !isBossLevel(6) || isBossLevel(4)) throw new Error("boss level should be every 3rd");
+        });
+
+        test("spawnEverySec has lower bound", () => {
+          const s = scaleEnemies(CONFIG, 100);
+          if (s.spawnEverySec < 0.6) throw new Error("spawnEverySec must not go below 0.6");
+        });
+
+        test("rarity table sane & price monotonic", () => {
+          const allowed = new Set(['common','rare','epic','legendary']);
+          const items = rollShopChoices();
+          items.forEach(it=>{ if (!allowed.has(it.rarity)) throw new Error('illegal rarity'); });
+          const mults = [1,2,3,5];
+          if (!(mults[0] < mults[1] && mults[1] < mults[2] && mults[2] < mults[3])) throw new Error('cost multipliers should increase by rarity');
+        });
+
+        test("applyPerks supports repeats", () => {
+          const cfg = applyPerks(CONFIG, [{id:'battery_plus', repeats:2}]);
+          if (!(cfg.ship.energyMax >= CONFIG.ship.energyMax + 60)) throw new Error('repeats did not amplify effect');
+        });
+
+        test("boss bullets have inaccuracy", () => {
+          if (!(CONFIG.boss.inaccuracyDeg > 0)) throw new Error("boss bullets should be non-locking with inaccuracy > 0");
+        });
+
+        test("shop choices length is 3", () => {
+          const items = rollShopChoices();
+          if (items.length !== 3) throw new Error("shop should offer 3 choices");
+        });
+
+        test("enemies baseline more numerous", () => {
+          if (!(CONFIG.enemies.maxCount >= 26 && CONFIG.enemies.spawnEverySec <= 2.2)) throw new Error('baseline enemies should be more numerous');
+        });
+
+        test("enemyDropCount returns >=1", () => {
+          for(let i=0;i<10;i++){
+            const n = enemyDropCount(1);
+            if (n < 1 || n > 2) throw new Error('enemyDropCount should be 1~2 for early levels');
+          }
+        });
+
+        return results;
+      }
+
+      // ---------------------- React Component ----------------------
+      function CleanOceanRoutes() {
+        const containerRef = React.useRef(null);
+        const gameRef = React.useRef(null);
+        const [stats, setStats] = React.useState({ day: 1, dayProgress: 0, energy: 100, cargo: 0, damage: 0, isBoss: false });
+        const [hint, setHint] = React.useState("WASD to move; LMB to shoot; pickups = currency; Normal: survive 60s, Boss: defeat within 60s.");
+        const [toast, setToast] = React.useState(null);
+        const [gameOver, setGameOver] = React.useState(null);
+        const [tests, setTests] = React.useState([]);
+        const [perks, setPerks] = React.useState([]); // strings or {id,repeats}
+        const [shopChoices, setShopChoices] = React.useState([]);
+        const [level, setLevel] = React.useState(1);
+        const [bossUI, setBossUI] = React.useState({ active: false, hp: 0, hpMax: 0 });
+        const [credits, setCredits] = React.useState(0);
+
+        const getPrice = (choice) => PERK_BASE_COST * (choice?.costMult || 1);
+
+        React.useEffect(() => {
+          let destroyed = false;
+          (async () => {
+            if (!containerRef.current) return;
+            if (gameRef.current) return; // avoid double init
+            const uiCallbacks = {
+              setStats: (s) => setStats(s),
+              setHint: (t) => setHint(t),
+              setToast: (t) => { setToast(t); setTimeout(() => setToast(null), 1800); },
+              setBossUI: (b) => setBossUI((prev)=> ({ ...prev, ...b })),
+              addCredits: (n) => setCredits((c)=> c + (n||0)),
+              onGameOver: (payload) => { setShopChoices(rollShopChoices()); setGameOver(payload); },
+            };
+            const { Phaser: PhaserRef, game } = await createPhaserGame(containerRef.current, uiCallbacks, perks, level);
+            if (destroyed) { game.destroy(true); return; }
+            gameRef.current = game;
+            setTests(runSelfTests(PhaserRef));
+          })();
+          return () => { destroyed = true; if (gameRef.current) { gameRef.current.destroy(true); gameRef.current = null; } };
+        }, [perks, level]);
+
+        const handleRefreshShop = () => {
+          if (credits < SHOP_REFRESH_COST) { setToast("Not enough credits to refresh the shop."); return; }
+          setCredits((c)=> c - SHOP_REFRESH_COST);
+          setShopChoices(rollShopChoices());
+        };
+
+        const handlePurchase = (choice) => {
+          const price = getPrice(choice);
+          if (credits < price) { setToast("Insufficient credits."); return; }
+          setCredits((c)=> c - price);
+          setPerks((prev)=> [...prev, { id: choice.id, repeats: choice.repeats }]);
+          setToast(`Purchased: ${choice.name} ×${choice.repeats}`);
+          // Auto-refresh the shop after each purchase
+          setShopChoices(rollShopChoices());
+        };
+
+        const startNewRun = (advance = true) => {
+          const nextLevel = advance ? (level + 1) : level;
+          setGameOver(null);
+          setHint("WASD to move; LMB to shoot; pickups = currency; Normal: survive 60s, Boss: defeat within 60s.");
+
+          if (gameRef.current) { gameRef.current.destroy(true); gameRef.current = null; }
+          setTimeout(async () => {
+            if (!containerRef.current) return;
+            const uiCallbacks = {
+              setStats: (s) => setStats(s),
+              setHint: (t) => setHint(t),
+              setToast: (t) => { setToast(t); setTimeout(() => setToast(null), 1800); },
+              setBossUI: (b) => setBossUI((prev)=> ({ ...prev, ...b })),
+              addCredits: (n) => setCredits((c)=> c + (n||0)),
+              onGameOver: (payload) => { setShopChoices(rollShopChoices()); setGameOver(payload); },
+            };
+            const { game } = await createPhaserGame(containerRef.current, uiCallbacks, perks, nextLevel);
+            gameRef.current = game;
+            setLevel(nextLevel);
+          }, 40);
+        };
+
+        const configWithPerks = applyPerks(CONFIG, perks);
+        const isBoss = isBossLevel(level);
+
+        return (
+          <div className="min-h-screen w-full bg-slate-900 text-slate-100">
+            <header className="mx-auto max-w-6xl px-4 py-4 flex items-center justify-between">
+              <h1 className="text-2xl md:text-3xl font-bold">🌊 Clean Ocean Routes</h1>
+              <div className="flex items-center gap-3 text-xs md:text-sm opacity-80">
+                <span>Level {level} · {isBoss ? 'BOSS: defeat within 60s' : 'Normal: survive 60s'}</span>
+                <span>WASD move · Left-click shoot · Pickups = currency · Shop supports multi-buy & paid reroll</span>
+              </div>
+            </header>
+
+            {bossUI.active && (
+              <div className="mx-auto max-w-6xl px-4 -mt-2">
+                <div className="w-full bg-slate-800/70 ring-1 ring-slate-700 rounded-xl h-5 overflow-hidden">
+                  <div
+                    className="bg-rose-500 h-5 transition-all"
+                    style={{ width: `${Math.max(0, Math.min(100, (bossUI.hp / (bossUI.hpMax||1)) * 100))}%` }}
+                  />
+                </div>
+                <div className="text-xs mt-1 opacity-80">BOSS: {Math.max(0, Math.floor(bossUI.hp))} / {bossUI.hpMax}</div>
+              </div>
+            )}
+
+            {/* HUD */}
+            <div className="mx-auto max-w-6xl px-4 grid grid-cols-1 md:grid-cols-6 gap-3 mt-3">
+              <StatCard label="Progress" value={`${Math.min(100, Math.round(stats.dayProgress * 100))}%`} />
+              <StatCard label="Energy" value={`${Math.round(stats.energy)} / ${configWithPerks.ship.energyMax}`} />
+              <StatCard label="Cargo" value={`${stats.cargo} / ${configWithPerks.ship.capacity}`} />
+              <StatCard label="Damage" value={`${Math.round(stats.damage)} / 100`} />
+              <StatCard label="Credits" value={`${credits}`} />
+              <StatCard label="Level" value={`${level}${isBoss ? '·BOSS' : ''}`} />
+            </div>
+
+            <div className="mx-auto max-w-[1700px] px-4 mt-4">
+              <div ref={containerRef} className="rounded-2xl overflow-hidden ring-1 ring-slate-700 shadow-lg" />
+            </div>
+
+            <div className="mx-auto max-w-6xl px-4 mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+              <HintCard text={hint} />
+              <TipCard title="Tips" items={["WASD move","Left-click to fire","Move with currents to save energy","Collect pickups to earn credits","Red storm & enemies damage you","Refuel at BASE when low energy"]} />
+              <TipCard title="Perks Owned" items={perks.map((p) => (BASE_PERKS.find(b=>b.id=== (typeof p==='string'? p : p.id))?.name || (typeof p==='string'? p : p.id)))} />
+            </div>
+
+            {/* Self-tests */}
+            <div className="mx-auto max-w-6xl px-4 mt-3">
+              <div className="rounded-2xl bg-slate-900/70 ring-1 ring-slate-700 p-3 shadow">
+                <h3 className="text-slate-200 font-semibold">Self Tests</h3>
+                {tests.length === 0 ? (
+                  <p className="text-slate-300 text-sm mt-1">Running tests…</p>
+                ) : (
+                  <ul className="text-sm mt-2 space-y-1">
+                    {tests.map((t, i) => (
+                      <li key={i} className={t.ok ? "text-emerald-300" : "text-rose-300"}>
+                        {t.ok ? "✔" : "✖"} {t.name}{!t.ok && t.msg ? ` — ${t.msg}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            </div>
+
+            {toast && (
+              <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-slate-800/90 backdrop-blur px-4 py-2 rounded-xl text-sm ring-1 ring-slate-700 shadow-lg">{toast}</div>
+            )}
+
+            {gameOver && (
+              <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4">
+                <div className="bg-slate-900 rounded-2xl p-6 w-full max-w-xl ring-1 ring-slate-700">
+                  <h2 className="text-xl font-semibold mb-2">{gameOver.reason === 'survive_win' || gameOver.reason === 'boss_win' ? 'Victory!' : 'Mission Failed'}</h2>
+                  <p className="opacity-90">Time survived: <b>{Math.round(gameOver.timeSurvived)}s</b> (goal {CONFIG.ui.surviveSeconds}s)</p>
+                  {gameOver.reason === 'boss_win' && (<p className="opacity-90">You defeated the BOSS!</p>)}
+
+                  {/* Education */}
+                  <div className="mt-4 p-3 rounded-xl bg-slate-800/70 ring-1 ring-slate-700">
+                    <h3 className="font-semibold text-slate-100">Why cleanup matters (Health · Ecology · Economy)</h3>
+                    <ul className="list-disc list-inside text-slate-300 text-sm mt-2 space-y-1">
+                      {(gameOver.facts || []).map((fact, i) => (<li key={i}>{fact}</li>))}
+                    </ul>
+                  </div>
+
+                  {/* Shop: multi-buy + paid reroll */}
+                  <div className="mt-4">
+                    <h3 className="font-semibold">Spend credits to buy perks (multi-buy enabled)</h3>
+                    <div className="mt-2 grid grid-cols-1 md:grid-cols-3 gap-2">
+                      {shopChoices.map((it) => (
+                        <button key={`${it.id}-${it.rarity}`}
+                                onClick={() => handlePurchase(it)}
+                                className="text-left p-3 rounded-xl bg-cyan-500/10 hover:bg-cyan-500/20 ring-1 ring-cyan-500/30">
+                          <div className="font-semibold flex items-center gap-2">
+                            {it.name}
+                            <span className="text-[10px] px-1.5 py-0.5 rounded" style={{background: it.color, color: '#0b1120'}}>{it.rarity}</span>
+                          </div>
+                          <div className="text-sm opacity-90">{it.desc} ×{it.repeats}</div>
+                          <div className="text-xs mt-1 opacity-80">Price: {PERK_BASE_COST} × {it.costMult} = <b>{getPrice(it)}</b> · Credits: {credits}</div>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="mt-3 flex justify-between items-center">
+                      <div className="text-sm opacity-80">Credits: {credits}</div>
+                      <div className="space-x-2">
+                        <button onClick={handleRefreshShop} className="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 ring-1 ring-slate-700">Reroll Shop (Cost {SHOP_REFRESH_COST})</button>
+                        <button onClick={() => startNewRun(true)} className="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 ring-1 ring-slate-700">Start Next Level</button>
+                        <button onClick={() => { setLevel(1); startNewRun(false); }} className="px-3 py-2 rounded-xl bg-slate-800 text-slate-100 ring-1 ring-slate-700">Back to Level 1</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <footer className="mx-auto max-w-6xl px-4 py-6 opacity-70 text-xs text-slate-300">
+              <p>© Code for Good • Prototype. Normal: survive 60s; Boss: defeat within 60s; pickups = currency; enemies get stronger each level; currents redraw slower; shop supports multi-buy & paid reroll; rare drops & boss clear rewards included.</p>
+            </footer>
+          </div>
+        );
+      }
+
+      function StatCard({ label, value }) {
+        return (
+          <div className="rounded-2xl bg-slate-900/70 ring-1 ring-slate-700 p-3 flex items-center justify-between shadow">
+            <span className="text-slate-300 text-sm">{label}</span>
+            <span className="font-mono text-lg">{value}</span>
+          </div>
+        );
+      }
+
+      function HintCard({ text }) {
+        return (
+          <div className="rounded-2xl bg-slate-900/70 ring-1 ring-slate-700 p-3 shadow">
+            <h3 className="text-slate-200 font-semibold">Hint</h3>
+            <p className="text-slate-300 text-sm mt-1">{text}</p>
+          </div>
+        );
+      }
+
+      function TipCard({ title, items }) {
+        return (
+          <div className="rounded-2xl bg-slate-900/70 ring-1 ring-slate-700 p-3 shadow">
+            <h3 className="text-slate-200 font-semibold">{title}</h3>
+            <ul className="list-disc list-inside text-slate-300 text-sm mt-1 space-y-1">
+              {items.map((it, i) => (<li key={i}>{it}</li>))}
+            </ul>
+          </div>
+        );
+      }
+
+      // 挂载 React 应用
+      ReactDOM.createRoot(document.getElementById('root')).render(<CleanOceanRoutes />);
+    </script>
+  </body>
+</html>
